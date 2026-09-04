@@ -1,5 +1,6 @@
 "use client";
 
+import { peerNetwork } from "@/lib/peerService";
 import { useState, useEffect, useRef } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
@@ -300,6 +301,10 @@ export default function DMPage() {
     const channelName = `frp_table_sync_${roomId}`;
     const bc = new BroadcastChannel(channelName);
     channelRef.current = bc;
+    peerNetwork.initHost(roomId, (peerId) => {
+      console.log("DM İnternet Odası Aktif:", peerId);
+    });
+    
 
     const applyPlayerUpdate = (incomingPlayer: CharacterDto) => {
       setParty(prevParty => {

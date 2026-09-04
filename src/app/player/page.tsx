@@ -1,5 +1,6 @@
 "use client";
 
+import { peerNetwork } from "@/lib/peerService";
 import { useState, useEffect, useRef } from "react";
 import dynamic from "next/dynamic";
 import { 
@@ -111,6 +112,37 @@ export default function PlayerPage() {
       setRoomInput(urlRoom.toUpperCase());
     }
   }, []);
+
+  // Oyuncu Masaya Bağlandığında PeerJS İstemcisi Başlat
+  useEffect(() => {
+    if (!roomId) return;
+
+    loadLatestMap(roomId);
+
+    peerNetwork.initClient(
+      roomId,
+      () => {
+        console.log("DM Masasına İnternet Üzerinden Bağlanıldı!");
+      },
+      (err) => {
+        console.error("Bağlantı hatası:", err);
+      }
+    );
+
+    peerNetwork.onDataCallback = (data) => {
+      if (data?.type === "COMBAT_SYNC" && data.combatants) {
+        setActiveCombatants(data.combatants);
+        setActiveTurnName(data.activeCombatantName);
+      }
+      if (data?.type === "SCENE_IMAGE_SYNC") {
+        setSceneImage({ url: data.imageUrl || null, title: data.title || "Mekan / Sahne Görseli" });
+      }
+    };
+
+    return () => {
+      peerNetwork.destroy();
+    };
+  }, [roomId]);
 
   const loadCharacterById = (id: string) => {
     const key = `frp_char_${id}`;
