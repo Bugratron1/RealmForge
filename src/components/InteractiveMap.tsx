@@ -7,9 +7,10 @@ import { ZoomIn, ZoomOut, RotateCcw } from "lucide-react";
 interface Props {
   imageUrl?: string | null;
   isDm?: boolean;
+  roomId?: string; // DM ve Player sayfalarının geçtiği prop artık tipte tanımlı
 }
 
-export default function InteractiveMap({ imageUrl, isDm = false }: Props) {
+export default function InteractiveMap({ imageUrl, isDm = false, roomId }: Props) {
   const [stageScale, setStageScale] = useState(1);
   const [stagePos, setStagePos] = useState({ x: 0, y: 0 });
   const [imageObj, setImageObj] = useState<HTMLImageElement | null>(null);
@@ -32,8 +33,14 @@ export default function InteractiveMap({ imageUrl, isDm = false }: Props) {
   }, [imageUrl]);
 
   // Canlı Kamera Senkronizasyonu (BroadcastChannel)
+  // Not: Bu kanal SADECE aynı tarayıcının farklı sekmeleri arasında pan/zoom senkronu sağlar.
+  // Farklı cihazlar arası anlık kamera senkronu şu an desteklenmiyor (kapsam dışı bırakıldı,
+  // sadece harita görselinin kendisi PeerJS ile senkronize ediliyor).
   useEffect(() => {
-    const bc = new BroadcastChannel("frp_map_camera_sync");
+    // Oda bazlı kanal ismi kullanmak, farklı odalardaki DM'lerin birbirinin
+    // kamerasını tetiklememesini sağlar.
+    const channelName = roomId ? `frp_map_camera_sync_${roomId}` : "frp_map_camera_sync";
+    const bc = new BroadcastChannel(channelName);
     channelRef.current = bc;
 
     // Oyuncuysa DM'in kamera hareketini dinle ve uygula
@@ -49,7 +56,7 @@ export default function InteractiveMap({ imageUrl, isDm = false }: Props) {
     return () => {
       bc.close();
     };
-  }, [isDm]);
+  }, [isDm, roomId]);
 
   // DM kamera konumunu oyunculara yayınlar
   const broadcastViewport = (scale: number, pos: { x: number; y: number }) => {

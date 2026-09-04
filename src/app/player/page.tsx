@@ -86,6 +86,19 @@ export default function PlayerPage() {
   const fadeTimerRef = useRef<NodeJS.Timeout | null>(null);
   const removeTimerRef = useRef<NodeJS.Timeout | null>(null);
 
+  // Bu ref'ler, useEffect dependency zincirini şişirmeden en güncel karakter
+  // verisine handleIncomingData / sendDataToDm içinden erişebilmek için var.
+  const characterSnapshotRef = useRef({
+    name, className, level, currentHp, maxHp, armorClass, stats,
+    avatarUrl, equipment, backstory, conditions
+  });
+  useEffect(() => {
+    characterSnapshotRef.current = {
+      name, className, level, currentHp, maxHp, armorClass, stats,
+      avatarUrl, equipment, backstory, conditions
+    };
+  }, [name, className, level, currentHp, maxHp, armorClass, stats, avatarUrl, equipment, backstory, conditions]);
+
   const calcMod = (val: number) => {
     const m = Math.floor((val - 10) / 2);
     return m >= 0 ? `+${m}` : `${m}`;
@@ -112,37 +125,6 @@ export default function PlayerPage() {
       setRoomInput(urlRoom.toUpperCase());
     }
   }, []);
-
-  // Oyuncu Masaya Bağlandığında PeerJS İstemcisi Başlat
-  useEffect(() => {
-    if (!roomId) return;
-
-    loadLatestMap(roomId);
-
-    peerNetwork.initClient(
-      roomId,
-      () => {
-        console.log("DM Masasına İnternet Üzerinden Bağlanıldı!");
-      },
-      (err) => {
-        console.error("Bağlantı hatası:", err);
-      }
-    );
-
-    peerNetwork.onDataCallback = (data) => {
-      if (data?.type === "COMBAT_SYNC" && data.combatants) {
-        setActiveCombatants(data.combatants);
-        setActiveTurnName(data.activeCombatantName);
-      }
-      if (data?.type === "SCENE_IMAGE_SYNC") {
-        setSceneImage({ url: data.imageUrl || null, title: data.title || "Mekan / Sahne Görseli" });
-      }
-    };
-
-    return () => {
-      peerNetwork.destroy();
-    };
-  }, [roomId]);
 
   const loadCharacterById = (id: string) => {
     const key = `frp_char_${id}`;
@@ -270,6 +252,9 @@ export default function PlayerPage() {
     reader.readAsDataURL(file);
   };
 
+  // Aynı cihaz/tarayıcı senaryosu için IndexedDB fallback.
+  // Farklı cihazdaki oyuncu haritayı MAP_UPDATED_SYNC payload'ının
+  // içindeki base64 (imageData) alanından alır.
   const loadLatestMap = async (targetRoom: string) => {
     if (!targetRoom) {
       setMapImageUrl(null);
@@ -298,20 +283,27 @@ export default function PlayerPage() {
     }, 10000);
   };
 
+  // Zar atışı artık hem BroadcastChannel (aynı tarayıcı) hem PeerJS
+  // (farklı cihaz) üzerinden DM'e gönderiliyor.
   const rollDice = (sides: number) => {
     const res = Math.floor(Math.random() * sides) + 1;
     triggerCinematicToast(`Sen d${sides} Attın ➔ ${res}`);
 
-    if (channelRef.current && roomId) {
-      channelRef.current.postMessage({
-        type: "DICE_ROLLED",
-        roomId: roomId,
-        sender: name || characterId || "Oyuncu",
-        die: `d${sides}`,
-        result: res,
-        timestamp: Date.now(),
-      });
+    if (!roomId) return;
+
+    const payload = {
+      type: "DICE_ROLLED",
+      roomId: roomId,
+      sender: name || characterId || "Oyuncu",
+      die: `d${sides}`,
+      result: res,
+      timestamp: Date.now(),
+    };
+
+    if (channelRef.current) {
+      channelRef.current.postMessage(payload);
     }
+    peerNetwork.send(payload);
   };
 
   const connectToRoom = (targetRoom: string) => {
@@ -325,14 +317,17 @@ export default function PlayerPage() {
     triggerCinematicToast(`[${cleanRoom}] Masasına Bağlanıldı!`);
   };
 
+  // Masadan ayrılma bildirimi artık hem BroadcastChannel hem PeerJS üzerinden gidiyor.
   const leaveCurrentRoom = () => {
-    if (channelRef.current && roomId) {
-      channelRef.current.postMessage({
+    if (roomId) {
+      const payload = {
         type: "PLAYER_LEFT",
         roomId: roomId,
         playerName: name,
         playerId: characterId
-      });
+      };
+      if (channelRef.current) channelRef.current.postMessage(payload);
+      peerNetwork.send(payload);
     }
     setRoomId("");
     setRoomInput("");
@@ -346,6 +341,12 @@ export default function PlayerPage() {
     setStatusMessage({ text: "Masadan ayrıldınız. Karakterinizi tek başınıza inceleyebilirsiniz.", type: "info" });
   };
 
+  // ============================================================
+  // ANA SENKRONİZASYON EFEKTİ
+  // BroadcastChannel (aynı tarayıcı) VE PeerJS (farklı cihaz) verilerini
+  // TEK bir ortak fonksiyonda (handleIncomingData) işler, böylece iki
+  // kanaldan da gelen mesajlar tutarlı şekilde uygulanır.
+  // ============================================================
   useEffect(() => {
     if (!roomId) {
       setActiveCombatants([]);
@@ -369,36 +370,50 @@ export default function PlayerPage() {
     const bc = new BroadcastChannel(channelName);
     channelRef.current = bc;
 
+    // İnternet üzerinden (farklı cihaz) DM'e bağlan
+    peerNetwork.initClient(
+      roomId,
+      () => {
+        console.log("DM Masasına İnternet Üzerinden Bağlanıldı!");
+        sendDataToDm();
+      },
+      (err) => {
+        console.error("Bağlantı hatası:", err);
+      }
+    );
+
     const sendDataToDm = () => {
       if (!characterId) return;
-      bc.postMessage({
+      const snap = characterSnapshotRef.current;
+      const payload = {
         type: "PLAYER_DATA_SYNC",
         roomId: roomId,
         player: {
           id: characterId,
-          name: name || `Kahraman (${characterId})`,
-          className: className || "Bilinmiyor",
-          level: level,
-          currentHp: currentHp,
-          maxHp: maxHp,
+          name: snap.name || `Kahraman (${characterId})`,
+          className: snap.className || "Bilinmiyor",
+          level: snap.level,
+          currentHp: snap.currentHp,
+          maxHp: snap.maxHp,
           tempHp: 0,
-          armorClass: armorClass,
-          stats: stats,
-          avatarUrl: avatarUrl,
-          equipment: equipment,
+          armorClass: snap.armorClass,
+          stats: snap.stats,
+          avatarUrl: snap.avatarUrl,
+          equipment: snap.equipment,
           gold: 0,
-          backstory: backstory,
-          conditions: conditions ? [conditions] : []
+          backstory: snap.backstory,
+          conditions: snap.conditions ? [snap.conditions] : []
         }
-      });
+      };
+      bc.postMessage(payload);
+      peerNetwork.send(payload);
     };
 
-    sendDataToDm();
+    // Hem BroadcastChannel hem PeerJS'ten gelen mesajları işleyen TEK fonksiyon
+    const handleIncomingData = (data: any) => {
+      if (!data) return;
 
-    bc.onmessage = (event) => {
-      const data = event.data;
-
-      if (data?.type === "ROOM_CLOSED" && data.roomId === roomId) {
+      if (data.type === "ROOM_CLOSED" && data.roomId === roomId) {
         setRoomId("");
         setRoomInput("");
         localStorage.removeItem("frp_player_connected_room");
@@ -413,11 +428,12 @@ export default function PlayerPage() {
         return;
       }
 
-      if (data?.type === "DM_PING" && data.roomId === roomId) {
+      if (data.type === "DM_PING" && data.roomId === roomId) {
         sendDataToDm();
+        return;
       }
 
-      if (data?.type === "PLAYER_KICKED" && (data.playerName === name || data.playerId === characterId)) {
+      if (data.type === "PLAYER_KICKED" && (data.playerName === name || data.playerId === characterId)) {
         setRoomId("");
         setRoomInput("");
         localStorage.removeItem("frp_player_connected_room");
@@ -432,41 +448,72 @@ export default function PlayerPage() {
         return;
       }
 
-      if (data?.type === "DICE_ROLLED" && data.sender !== (name || characterId)) {
+      if (data.type === "DICE_ROLLED" && data.sender !== (name || characterId)) {
         triggerCinematicToast(`${data.sender} [${data.die}] Attı ➔ ${data.result}`);
+        return;
       }
 
-      if (data?.type === "MAP_UPDATED_SYNC") {
-        loadLatestMap(roomId);
+      if (data.type === "MAP_UPDATED_SYNC") {
+        if (data.imageData) {
+          // Farklı cihaz senaryosu: harita base64 olarak doğrudan geldi
+          setMapImageUrl(data.imageData);
+        } else {
+          // Aynı tarayıcı/tab senaryosu: IndexedDB'den oku
+          loadLatestMap(roomId);
+        }
+        return;
       }
 
-      if (data?.type === "MAP_REMOVED_SYNC") {
+      if (data.type === "MAP_REMOVED_SYNC") {
         setMapImageUrl(null);
         triggerCinematicToast("🗺️ DM haritayı masadan kaldırdı.");
+        return;
       }
 
-      if (data?.type === "SCENE_IMAGE_SYNC") {
+      if (data.type === "SCENE_IMAGE_SYNC") {
         setSceneImage({ url: data.imageUrl || null, title: data.title || "Mekan / Sahne Görseli" });
         if (data.imageUrl) {
           triggerCinematicToast("🖼️ DM yeni bir sahne görseli yansıttı!");
         }
+        return;
       }
 
-      if (data?.type === "COMBAT_SYNC" && data.combatants) {
+      if (data.type === "COMBAT_SYNC" && data.combatants) {
         setActiveCombatants(data.combatants);
         setActiveTurnName(data.activeCombatantName);
+        return;
       }
     };
+
+    // Aynı tarayıcı sekmeleri arası
+    bc.onmessage = (event) => {
+      handleIncomingData(event.data);
+    };
+
+    // Farklı cihaz - internet üzerinden (PeerJS)
+    peerNetwork.onDataCallback = (data) => {
+      handleIncomingData(data);
+    };
+
+    // Odaya girildiğinde karakter verisini hemen DM'e gönder
+    // (BroadcastChannel için hemen, PeerJS bağlantısı açılınca initClient callback'i tetikleyecek)
+    sendDataToDm();
 
     return () => {
       bc.close();
+      peerNetwork.destroy();
     };
-  }, [roomId, name, characterId, className, level, currentHp, maxHp, armorClass, stats, avatarUrl, equipment, backstory, conditions]);
+    // Not: characterId, name vb. characterSnapshotRef üzerinden okunuyor,
+    // bu yüzden bağımlılık listesi sadece roomId ve characterId ile sınırlı
+    // tutuluyor (gereksiz reconnect'leri önlemek için).
+  }, [roomId, characterId]);
 
+  // Karakter verisi değiştikçe DM'e güncel veriyi hem BroadcastChannel
+  // hem PeerJS üzerinden gönder.
   useEffect(() => {
-    if (!channelRef.current || !roomId || !characterId) return;
+    if (!roomId || !characterId) return;
 
-    channelRef.current.postMessage({
+    const payload = {
       type: "PLAYER_DATA_SYNC",
       roomId: roomId,
       player: {
@@ -485,7 +532,12 @@ export default function PlayerPage() {
         backstory: backstory,
         conditions: conditions ? [conditions] : []
       }
-    });
+    };
+
+    if (channelRef.current) {
+      channelRef.current.postMessage(payload);
+    }
+    peerNetwork.send(payload);
   }, [name, className, level, currentHp, maxHp, armorClass, stats, avatarUrl, equipment, backstory, conditions, roomId, characterId]);
 
   if (!characterId) {
@@ -750,7 +802,7 @@ export default function PlayerPage() {
 
             {mapImageUrl ? (
               <div className="relative pointer-events-none select-none rounded-xl overflow-hidden min-h-[380px]">
-                <InteractiveMap imageUrl={mapImageUrl} isDm={false} />
+                <InteractiveMap imageUrl={mapImageUrl} isDm={false} roomId={roomId} />
               </div>
             ) : (
               <div className="p-10 text-center text-xs text-slate-500 border border-dashed border-slate-800 rounded-xl">

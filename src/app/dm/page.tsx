@@ -125,6 +125,7 @@ export default function DMPage() {
       }
     } catch (err) {}
 
+    // Aynı cihaz/tarayıcı senaryosu için IndexedDB fallback (PeerJS ile bağlı olmayan sekmeler için)
     getActiveMap(roomId).then((blob) => {
       setMapImageUrl(blob ? URL.createObjectURL(blob) : null);
     });
@@ -142,6 +143,7 @@ export default function DMPage() {
     if (channelRef.current) {
       channelRef.current.postMessage(payload);
     }
+    peerNetwork.send(payload);
     localStorage.setItem(`frp_combat_${roomId}`, JSON.stringify(payload));
   };
 
@@ -156,6 +158,7 @@ export default function DMPage() {
     if (channelRef.current) {
       channelRef.current.postMessage(payload);
     }
+    peerNetwork.send(payload);
     localStorage.setItem(`frp_scene_${roomId}`, JSON.stringify({ imageUrl: img, title }));
   };
 
@@ -182,13 +185,16 @@ export default function DMPage() {
   const closeTableEntirely = () => {
     if (!confirm("Masayı kapatmak istediğinize emin misiniz? Savaş alanı sıfırlanacak ve oyuncular masadan ayrılacaktır.")) return;
 
+    const closePayload = {
+      type: "ROOM_CLOSED",
+      roomId: roomId,
+      timestamp: Date.now()
+    };
+
     if (channelRef.current) {
-      channelRef.current.postMessage({
-        type: "ROOM_CLOSED",
-        roomId: roomId,
-        timestamp: Date.now()
-      });
+      channelRef.current.postMessage(closePayload);
     }
+    peerNetwork.send(closePayload);
 
     localStorage.removeItem(`frp_combat_${roomId}`);
     localStorage.removeItem(`frp_scene_${roomId}`);
@@ -206,12 +212,14 @@ export default function DMPage() {
 
   useEffect(() => {
     const handleBeforeUnload = () => {
-      if (channelRef.current && roomId) {
-        channelRef.current.postMessage({
+      if (roomId) {
+        const closePayload = {
           type: "ROOM_CLOSED",
           roomId: roomId,
           timestamp: Date.now()
-        });
+        };
+        if (channelRef.current) channelRef.current.postMessage(closePayload);
+        peerNetwork.send(closePayload);
       }
     };
 
@@ -222,13 +230,13 @@ export default function DMPage() {
   const createNewTable = () => {
     if (!confirm("Temiz bir masa açmak istiyor musunuz? Mevcut masa verileriniz bu oda kodunda kalacaktır.")) return;
 
-    if (channelRef.current) {
-      channelRef.current.postMessage({
-        type: "ROOM_CLOSED",
-        roomId: roomId,
-        timestamp: Date.now()
-      });
-    }
+    const closePayload = {
+      type: "ROOM_CLOSED",
+      roomId: roomId,
+      timestamp: Date.now()
+    };
+    if (channelRef.current) channelRef.current.postMessage(closePayload);
+    peerNetwork.send(closePayload);
 
     const newCode = `FRP-${Math.floor(1000 + Math.random() * 9000)}`;
     setRoomId(newCode);
@@ -257,14 +265,14 @@ export default function DMPage() {
     setCombatants(updatedCombat);
     broadcastCombatState(updatedCombat, activeTurnIndex);
 
-    if (channelRef.current) {
-      channelRef.current.postMessage({
-        type: "PLAYER_KICKED",
-        roomId: roomId,
-        playerName: playerName,
-        playerId: playerId
-      });
-    }
+    const kickPayload = {
+      type: "PLAYER_KICKED",
+      roomId: roomId,
+      playerName: playerName,
+      playerId: playerId
+    };
+    if (channelRef.current) channelRef.current.postMessage(kickPayload);
+    peerNetwork.send(kickPayload);
 
     triggerCinematicRoll(`🚫 ${playerName} masadan çıkarıldı.`);
   };
@@ -295,16 +303,18 @@ export default function DMPage() {
     }, 10000);
   };
 
+  // PeerJS ve BroadcastChannel Entegrasyonu (Host Tarafı)
   useEffect(() => {
     if (!roomId) return;
 
     const channelName = `frp_table_sync_${roomId}`;
     const bc = new BroadcastChannel(channelName);
     channelRef.current = bc;
+
+    // İnternet Üzerinden PeerJS Host Başlat
     peerNetwork.initHost(roomId, (peerId) => {
       console.log("DM İnternet Odası Aktif:", peerId);
     });
-    
 
     const applyPlayerUpdate = (incomingPlayer: CharacterDto) => {
       setParty(prevParty => {
@@ -331,13 +341,7 @@ export default function DMPage() {
       }));
     };
 
-    bc.postMessage({
-      type: "DM_PING",
-      roomId: roomId
-    });
-
-    bc.onmessage = (event) => {
-      const data = event.data;
+    const handleIncomingData = (data: any) => {
       if (data?.type === "DICE_ROLLED") {
         triggerCinematicRoll(`${data.sender} [${data.die}] Attı ➔ ${data.result}`, false);
       }
@@ -354,8 +358,24 @@ export default function DMPage() {
       }
     };
 
+    // PeerJS üzerinden gelen verileri dinle (farklı cihazdaki oyuncular)
+    peerNetwork.onDataCallback = (data) => {
+      handleIncomingData(data);
+    };
+
+    bc.postMessage({
+      type: "DM_PING",
+      roomId: roomId
+    });
+
+    // Aynı tarayıcıdaki farklı sekmelerden gelen verileri dinle
+    bc.onmessage = (event) => {
+      handleIncomingData(event.data);
+    };
+
     return () => {
       bc.close();
+      peerNetwork.destroy();
     };
   }, [roomId]);
 
@@ -365,36 +385,56 @@ export default function DMPage() {
     setTimeout(() => setCopied(false), 2000);
   };
 
+  // Harita yüklendiğinde: hem IndexedDB'ye (aynı cihaz/tab senaryosu için) kaydeder,
+  // hem de base64 olarak PeerJS + BroadcastChannel üzerinden anlık yayınlar
+  // (farklı cihazdaki oyuncular için).
   const handleMapUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file || !roomId) return;
-    setMapImageUrl(URL.createObjectURL(file));
+
+    const localUrl = URL.createObjectURL(file);
+    setMapImageUrl(localUrl);
+
     await saveActiveMap(file, roomId);
-    publishMapToTable();
+
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      const base64 = reader.result as string;
+      publishMapToTable(base64);
+    };
+    reader.readAsDataURL(file);
   };
 
   const handleRemoveMap = async () => {
     if (!confirm("Haritayı masadan kaldırmak istediğinize emin misiniz?")) return;
     await removeActiveMap(roomId);
     setMapImageUrl(null);
-    if (channelRef.current) {
-      channelRef.current.postMessage({
-        type: "MAP_REMOVED_SYNC",
-        roomId: roomId,
-        timestamp: Date.now()
-      });
-    }
+    
+    const removePayload = {
+      type: "MAP_REMOVED_SYNC",
+      roomId: roomId,
+      timestamp: Date.now()
+    };
+    if (channelRef.current) channelRef.current.postMessage(removePayload);
+    peerNetwork.send(removePayload);
+
     triggerCinematicRoll("🗺️ Harita masadan kaldırıldı.");
   };
 
-  const publishMapToTable = () => {
+  // imageData verilirse (base64) bunu payload'a ekler, böylece farklı cihazdaki
+  // oyuncu da haritayı IndexedDB'ye ihtiyaç duymadan direkt görüntüleyebilir.
+  const publishMapToTable = (imageData?: string) => {
+    const mapPayload = {
+      type: "MAP_UPDATED_SYNC",
+      roomId: roomId,
+      imageData: imageData || null,
+      timestamp: Date.now()
+    };
     if (channelRef.current) {
-      channelRef.current.postMessage({
-        type: "MAP_UPDATED_SYNC",
-        roomId: roomId,
-        timestamp: Date.now()
-      });
+      channelRef.current.postMessage(mapPayload);
     }
+    peerNetwork.send(mapPayload);
+    triggerCinematicRoll("🗺️ Harita masaya senkronize edildi.");
   };
 
   const rollDice = (sides: number, secret: boolean = false) => {
@@ -402,15 +442,17 @@ export default function DMPage() {
     const label = secret ? `GİZLİ d${sides} ➔ ${result}` : `DM d${sides} Attı ➔ ${result}`;
     triggerCinematicRoll(label, secret);
 
-    if (!secret && channelRef.current) {
-      channelRef.current.postMessage({
+    if (!secret) {
+      const dicePayload = {
         type: "DICE_ROLLED",
         roomId: roomId,
         sender: "Dungeon Master",
         die: `d${sides}`,
         result: result,
         timestamp: Date.now(),
-      });
+      };
+      if (channelRef.current) channelRef.current.postMessage(dicePayload);
+      peerNetwork.send(dicePayload);
     }
   };
 
@@ -780,7 +822,7 @@ export default function DMPage() {
             </div>
 
             <div className="flex-1 min-h-[190px] rounded-xl overflow-hidden border border-slate-800/60 bg-slate-950">
-              <InteractiveMap imageUrl={mapImageUrl} isDm={true} />
+              <InteractiveMap imageUrl={mapImageUrl} isDm={true} roomId={roomId} />
             </div>
 
             <div className="flex gap-2 pt-1">
@@ -800,10 +842,11 @@ export default function DMPage() {
               )}
 
               <button 
-                onClick={publishMapToTable}
+                onClick={() => publishMapToTable()}
                 className="flex-1 py-2 rounded-xl bg-amber-600 hover:bg-amber-500 text-white text-xs font-semibold transition shadow-md shadow-amber-600/20 active:scale-95"
+                title="Yeni resim seçmeden mevcut haritayı yeniden yayınlar (sadece sinyal, aynı cihaz senaryosu için)"
               >
-                Senkronize Et
+                Yeniden Senkronize Et
               </button>
             </div>
           </section>
