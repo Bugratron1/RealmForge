@@ -8,18 +8,25 @@ export class PeerNetwork {
   onDataCallback: (data: any) => void = () => {};
   onConnectionCallback: () => void = () => {};
 
-  initHost(roomId: string, onReady: (peerId: string) => void) {
+  // DM için Host (Sunucu) Kurulumu
+  initHost(roomId: string, onReady: (peerId: string) => void, onError?: (err: any) => void) {
     const peerId = getPeerRoomId(roomId);
     
+    if (this.peer) {
+      this.destroy();
+    }
+
     const peer = new Peer(peerId, {
-      debug: 1,
+      debug: 2,
     });
 
     peer.on("open", (id) => {
+      console.log("Peer Host Açıldı, ID:", id);
       onReady(id);
     });
 
     peer.on("connection", (conn) => {
+      console.log("Yeni bir oyuncu bağlandı!", conn.peer);
       this.connections.push(conn);
       this.onConnectionCallback();
 
@@ -33,21 +40,37 @@ export class PeerNetwork {
       });
 
       conn.on("close", () => {
+        console.log("Bir oyuncu bağlantıyı kesti.");
         this.connections = this.connections.filter((c) => c !== conn);
       });
+    });
+
+    peer.on("error", (err) => {
+      console.error("Peer Host Hatası:", err);
+      if (onError) onError(err);
     });
 
     this.peer = peer;
   }
 
+  // Oyuncu için Client (İstemci) Kurulumu
   initClient(roomId: string, onConnected: () => void, onError: (err: any) => void) {
     const hostPeerId = getPeerRoomId(roomId);
-    const peer = new Peer({ debug: 1 });
+    
+    if (this.peer) {
+      this.destroy();
+    }
+
+    // Hataya sebep olan kısım düzeltildi:
+    const clientId = `client-${Math.random().toString(36).substring(2, 9)}`;
+    const peer = new Peer(clientId, { debug: 2 });
 
     peer.on("open", () => {
-      const conn = peer.connect(hostPeerId);
+      console.log("Client Peer Açıldı, DM'e bağlanılıyor:", hostPeerId);
+      const conn = peer.connect(hostPeerId, { reliable: true });
 
       conn.on("open", () => {
+        console.log("DM Masasına Başarıyla Bağlandı!");
         this.connections = [conn];
         onConnected();
       });
@@ -57,11 +80,13 @@ export class PeerNetwork {
       });
 
       conn.on("error", (err) => {
+        console.error("Client Connection Error:", err);
         onError(err);
       });
     });
 
     peer.on("error", (err) => {
+      console.error("Client Peer Error:", err);
       onError(err);
     });
 
@@ -78,8 +103,10 @@ export class PeerNetwork {
 
   destroy() {
     this.connections.forEach((c) => c.close());
+    this.connections = [];
     if (this.peer) {
       this.peer.destroy();
+      this.peer = null;
     }
   }
 }
