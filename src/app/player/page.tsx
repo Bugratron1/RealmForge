@@ -361,7 +361,6 @@ export default function PlayerPage() {
       notes,
       equipment,
       bag,
-      notes,
       lastJoinedRoom,
     };
 
@@ -385,8 +384,7 @@ export default function PlayerPage() {
     notes,
     equipment,
     bag,
-    notes,
-    lastJoinedRoom,
+      lastJoinedRoom,
     isLoaded,
     characterId,
   ]);
