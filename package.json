@@ -9,6 +9,8 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "@neondatabase/serverless": "^1.1.0",
+    "@vercel/postgres": "^0.10.0",
     "canvas-confetti": "^1.9.4",
     "konva": "^10.3.2",
     "lucide-react": "^1.40.0",
