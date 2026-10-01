@@ -153,8 +153,7 @@ export default function DMPage() {
     if (!roomId) return;
 
     try {
-      const savedNotes = localStorage.getItem(`frp_dm_notes_${roomId}`);
-      setChapterNotes(savedNotes ? JSON.parse(savedNotes) : {});
+
 
       const savedCombat = localStorage.getItem(`frp_combat_${roomId}`);
       if (savedCombat) {
@@ -188,7 +187,7 @@ export default function DMPage() {
     .then(data => {
       if (data.success && data.data) {
         const d = data.data;
-        if (d.notes) setChapterNotes(d.notes);
+
         if (d.combatants) setCombatants(d.combatants);
         if (d.active_turn_index !== undefined) setActiveTurnIndex(d.active_turn_index);
         if (d.scene_image_url) setSceneImageUrl(d.scene_image_url);
@@ -368,7 +367,7 @@ export default function DMPage() {
       localStorage.setItem("frp_all_known_rooms", JSON.stringify([newCode, ...known]));
     } catch (e) {}
 
-    setChapterNotes({});
+
     setCombatants([]);
     setActiveTurnIndex(0);
     setParty([]);
