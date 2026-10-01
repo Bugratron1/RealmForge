@@ -28,7 +28,8 @@ import {
   Camera,
   RotateCcw,
   Sparkles,
-  ImageIcon
+  ImageIcon,
+  Grid
 } from "lucide-react";
 import { CombatantDto, CharacterDto } from "@/types/game";
 import { saveActiveMap, getActiveMap, removeActiveMap } from "@/lib/mapDb";
@@ -55,6 +56,52 @@ export default function DMPage() {
   const [party, setParty] = useState<CharacterDto[]>([]);
   const [selectedPlayer, setSelectedPlayer] = useState<CharacterDto | null>(null);
 
+  const updateSelectedPlayerField = (field: keyof CharacterDto, value: any) => {
+    if (!selectedPlayer) return;
+    setSelectedPlayer({ ...selectedPlayer, [field]: value });
+  };
+
+  const updateSelectedPlayerStat = (stat: keyof CharacterDto['stats'], value: number) => {
+    if (!selectedPlayer) return;
+    setSelectedPlayer({
+      ...selectedPlayer,
+      stats: { ...selectedPlayer.stats, [stat]: value }
+    });
+  };
+
+  const savePlayerChanges = () => {
+    if (!selectedPlayer) return;
+    
+    // Yere (DM ekranına) kaydet
+    setParty(prev => prev.map(p => p.id === selectedPlayer.id ? selectedPlayer : p));
+    
+    // Savaş alanındaysa güncelle
+    setCombatants(prev => prev.map(c => {
+      if (c.name === selectedPlayer.name) {
+        return {
+          ...c,
+          hp: selectedPlayer.currentHp,
+          maxHp: selectedPlayer.maxHp,
+          armorClass: selectedPlayer.armorClass
+        };
+      }
+      return c;
+    }));
+
+    // Oyuncuya (Player) bildir
+    const payload = {
+      type: "DM_OVERRIDE_PLAYER",
+      roomId: roomId,
+      player: selectedPlayer
+    };
+    if (channelRef.current) {
+      channelRef.current.postMessage(payload);
+    }
+    peerNetwork.send(payload);
+
+    triggerCinematicRoll(`DM, ${selectedPlayer.name} adlı oyuncuyu güncelledi.`);
+  };
+
   const [combatants, setCombatants] = useState<CombatantDto[]>([]);
   const [activeTurnIndex, setActiveTurnIndex] = useState(0);
   const activeTurnIndexRef = useRef(0);
@@ -71,8 +118,9 @@ export default function DMPage() {
     avatarUrl: null
   });
 
-  const [activeChapter, setActiveChapter] = useState(1);
-  const [chapterNotes, setChapterNotes] = useState<Record<number, string>>({});
+  const [gridSize, setGridSize] = useState(32);
+  const [gridTokens, setGridTokens] = useState<Record<string, { x: number, y: number, name: string, isPlayer: boolean, avatarUrl?: string | null }>>({});
+  const [gridBgUrl, setGridBgUrl] = useState<string | null>(null);
   const [saveStatus, setSaveStatus] = useState<"saved" | "saving">("saved");
 
   const [lastRoll, setLastRoll] = useState<{ text: string; isFading: boolean; isSecret: boolean; key: number } | null>(null);
@@ -125,10 +173,29 @@ export default function DMPage() {
       }
     } catch (err) {}
 
-    // Aynı cihaz/tarayıcı senaryosu için IndexedDB fallback (PeerJS ile bağlı olmayan sekmeler için)
+    // IndexedDB fallback for Map
     getActiveMap(roomId).then((blob) => {
       setMapImageUrl(blob ? URL.createObjectURL(blob) : null);
     });
+
+    // DB'den yükle
+    fetch('/api/dm/sync', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'get', roomId })
+    })
+    .then(r => r.json())
+    .then(data => {
+      if (data.success && data.data) {
+        const d = data.data;
+        if (d.notes) setChapterNotes(d.notes);
+        if (d.combatants) setCombatants(d.combatants);
+        if (d.active_turn_index !== undefined) setActiveTurnIndex(d.active_turn_index);
+        if (d.scene_image_url) setSceneImageUrl(d.scene_image_url);
+        if (d.scene_title) setSceneTitle(d.scene_title);
+      }
+    })
+    .catch(console.error);
   }, [roomId]);
 
   const broadcastCombatState = (list: CombatantDto[], turnIdx: number) => {
@@ -145,6 +212,12 @@ export default function DMPage() {
     }
     peerNetwork.send(payload);
     localStorage.setItem(`frp_combat_${roomId}`, JSON.stringify(payload));
+
+    fetch('/api/dm/sync', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'save_combat', roomId, combatants: list, activeTurnIndex: turnIdx })
+    }).catch(console.error);
   };
 
   const broadcastSceneImage = (img: string | null, title: string = "Mekan / Sahne Görseli") => {
@@ -160,6 +233,12 @@ export default function DMPage() {
     }
     peerNetwork.send(payload);
     localStorage.setItem(`frp_scene_${roomId}`, JSON.stringify({ imageUrl: img, title }));
+
+    fetch('/api/dm/sync', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'save_scene', roomId, sceneImageUrl: img, sceneTitle: title })
+    }).catch(console.error);
   };
 
   const handleSceneUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -199,6 +278,13 @@ export default function DMPage() {
     localStorage.removeItem(`frp_combat_${roomId}`);
     localStorage.removeItem(`frp_scene_${roomId}`);
     localStorage.removeItem("frp_current_active_dm_room");
+
+    fetch('/api/dm/sync', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'clear', roomId })
+    }).catch(console.error);
+
     router.push("/");
   };
 
@@ -208,6 +294,40 @@ export default function DMPage() {
     setActiveTurnIndex(0);
     broadcastCombatState([], 0);
     triggerCinematicRoll("⚔️ Savaş alanı temizlendi.");
+  };
+
+  const updateCombatantStat = (id: string, stat: 'hp' | 'armorClass', delta: number) => {
+    setCombatants(prev => {
+      const newCombatants = prev.map(c => {
+        if (c.id === id) {
+          const newValue = Math.max(0, c[stat] + delta);
+          
+          if (c.isPlayer) {
+             const playerInParty = party.find(p => p.name === c.name);
+             if (playerInParty) {
+                const updatedPlayer = { ...playerInParty, [stat === 'hp' ? 'currentHp' : 'armorClass']: newValue };
+                setParty(pParty => pParty.map(p => p.id === updatedPlayer.id ? updatedPlayer : p));
+                
+                if (selectedPlayer?.id === updatedPlayer.id) {
+                   setSelectedPlayer(updatedPlayer);
+                }
+
+                const payload = {
+                  type: "DM_OVERRIDE_PLAYER",
+                  roomId: roomId,
+                  player: updatedPlayer
+                };
+                if (channelRef.current) channelRef.current.postMessage(payload);
+                peerNetwork.send(payload);
+             }
+          }
+          return { ...c, [stat]: newValue };
+        }
+        return c;
+      });
+      broadcastCombatState(newCombatants, activeTurnIndexRef.current);
+      return newCombatants;
+    });
   };
 
   useEffect(() => {
@@ -277,17 +397,6 @@ export default function DMPage() {
     triggerCinematicRoll(`🚫 ${playerName} masadan çıkarıldı.`);
   };
 
-  const handleNoteChange = (text: string) => {
-    setSaveStatus("saving");
-    const updated = { ...chapterNotes, [activeChapter]: text };
-    setChapterNotes(updated);
-
-    try {
-      localStorage.setItem(`frp_dm_notes_${roomId}`, JSON.stringify(updated));
-      setTimeout(() => setSaveStatus("saved"), 350);
-    } catch (err) {}
-  };
-
   const triggerCinematicRoll = (text: string, isSecret: boolean = false) => {
     if (fadeTimerRef.current) clearTimeout(fadeTimerRef.current);
     if (removeTimerRef.current) clearTimeout(removeTimerRef.current);
@@ -341,6 +450,7 @@ export default function DMPage() {
       }));
     };
 
+
     const handleIncomingData = (data: any) => {
       if (data?.type === "DICE_ROLLED") {
         triggerCinematicRoll(`${data.sender} [${data.die}] Attı ➔ ${data.result}`, false);
@@ -354,6 +464,16 @@ export default function DMPage() {
           const filtered = prev.filter(c => c.name !== data.playerName);
           broadcastCombatState(filtered, activeTurnIndexRef.current);
           return filtered;
+        });
+      }
+      if (data?.type === "BATTLEMAP_UPDATE_TOKEN") {
+        setGridTokens(prev => {
+          const token = prev[data.tokenId];
+          if (!token) return prev;
+          return {
+            ...prev,
+            [data.tokenId]: { ...token, x: data.x, y: data.y }
+          };
         });
       }
     };
@@ -378,6 +498,29 @@ export default function DMPage() {
       peerNetwork.destroy();
     };
   }, [roomId]);
+
+  useEffect(() => {
+    if (!roomId) return;
+    const payload = {
+      type: "BATTLEMAP_SYNC",
+      roomId,
+      gridSize,
+      gridTokens,
+      gridBgUrl
+    };
+    if (channelRef.current) channelRef.current.postMessage(payload);
+    peerNetwork.send(payload);
+  }, [gridTokens, gridSize, gridBgUrl, roomId]);
+
+  const handleGridBgUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      setGridBgUrl(reader.result as string);
+    };
+    reader.readAsDataURL(file);
+  };
 
   const copyRoomCode = () => {
     navigator.clipboard.writeText(roomId);
@@ -710,14 +853,18 @@ export default function DMPage() {
                 combatants.map((c, idx) => (
                   <div 
                     key={c.id} 
-                    className={`p-2.5 rounded-xl border flex items-center justify-between transition ${
+                    draggable
+                    onDragStart={(e) => {
+                      e.dataTransfer.setData("token_id", c.id);
+                    }}
+                    className={`p-2.5 rounded-xl border flex items-center justify-between transition cursor-grab active:cursor-grabbing ${
                       idx === activeTurnIndex 
                         ? "bg-amber-500/15 border-amber-500/70 shadow-lg shadow-amber-500/10 ring-1 ring-amber-500/50" 
                         : c.isPlayer ? "bg-blue-950/20 border-blue-800/40" : "bg-slate-950/60 border-slate-800"
                     }`}
                   >
                     <div className="flex items-center gap-3">
-                      <div className={`w-12 h-12 rounded-xl overflow-hidden border-2 flex items-center justify-center shrink-0 bg-slate-900 shadow-md ${
+                      <div className={`w-12 h-12 rounded-xl overflow-hidden border-2 flex items-center justify-center shrink-0 bg-slate-900 shadow-md pointer-events-none ${
                         idx === activeTurnIndex ? "border-amber-400 ring-2 ring-amber-500/30" : "border-slate-700"
                       }`}>
                         {c.avatarUrl ? (
@@ -742,9 +889,23 @@ export default function DMPage() {
                     </div>
 
                     <div className="flex items-center gap-2.5 text-xs font-mono">
-                      <div className="text-right">
-                        <span className="text-blue-400 block font-bold text-[11px]">🛡️ {c.armorClass} AC</span>
-                        <span className="text-emerald-400 block font-bold text-[11px]">❤️ {c.hp}/{c.maxHp}</span>
+                      <div className="flex flex-col gap-1 items-end mr-2">
+                        <div className="flex items-center gap-1.5">
+                           <button onClick={() => updateCombatantStat(c.id, 'armorClass', -1)} className="text-[10px] bg-blue-950/40 border border-blue-900/50 hover:bg-blue-900/60 text-blue-400 w-5 h-5 rounded flex items-center justify-center">-</button>
+                           <span className="text-blue-400 font-bold text-[11px] w-9 text-center">🛡️ {c.armorClass}</span>
+                           <button onClick={() => updateCombatantStat(c.id, 'armorClass', 1)} className="text-[10px] bg-blue-950/40 border border-blue-900/50 hover:bg-blue-900/60 text-blue-400 w-5 h-5 rounded flex items-center justify-center">+</button>
+                        </div>
+                        <div className="flex items-center gap-1.5">
+                           <div className="flex gap-0.5">
+                             <button onClick={() => updateCombatantStat(c.id, 'hp', -5)} className="text-[9px] bg-red-950/40 border border-red-900/50 hover:bg-red-900/60 text-red-400 w-5 h-5 rounded flex items-center justify-center" title="-5 HP">-5</button>
+                             <button onClick={() => updateCombatantStat(c.id, 'hp', -1)} className="text-[10px] bg-red-950/40 border border-red-900/50 hover:bg-red-900/60 text-red-400 w-5 h-5 rounded flex items-center justify-center">-</button>
+                           </div>
+                           <span className="text-emerald-400 font-bold text-[11px] w-14 text-center">❤️ {c.hp}/{c.maxHp}</span>
+                           <div className="flex gap-0.5">
+                             <button onClick={() => updateCombatantStat(c.id, 'hp', 1)} className="text-[10px] bg-emerald-950/40 border border-emerald-900/50 hover:bg-emerald-900/60 text-emerald-400 w-5 h-5 rounded flex items-center justify-center">+</button>
+                             <button onClick={() => updateCombatantStat(c.id, 'hp', 5)} className="text-[9px] bg-emerald-950/40 border border-emerald-900/50 hover:bg-emerald-900/60 text-emerald-400 w-5 h-5 rounded flex items-center justify-center" title="+5 HP">+5</button>
+                           </div>
+                        </div>
                       </div>
                       <button onClick={() => removeCombatant(c.id)} className="text-slate-600 hover:text-red-400 p-1">
                         <Trash2 className="w-4 h-4" />
@@ -941,46 +1102,117 @@ export default function DMPage() {
             </button>
           </div>
 
-          <div className="bg-slate-900/40 border border-slate-800 rounded-2xl p-4 flex-1 flex flex-col gap-3">
+          <div className="bg-slate-900/40 border border-slate-800 rounded-2xl p-4 flex-1 flex flex-col gap-3 min-h-[300px]">
             <div className="flex items-center justify-between border-b border-slate-800 pb-2.5">
               <div className="flex items-center gap-2">
-                <span className="flex items-center gap-1.5 text-xs text-slate-300 font-bold">
-                  <BookOpen className="w-4 h-4 text-emerald-400" /> SEANS NOTLARI
-                </span>
-                <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded transition ${
-                  saveStatus === "saved" ? "text-emerald-400 bg-emerald-950/40" : "text-amber-400 bg-amber-950/40"
-                }`}>
-                  {saveStatus === "saved" ? "✓ Kaydedildi" : "Kaydediliyor..."}
+                <span className="flex items-center gap-1.5 text-xs text-slate-300 font-bold uppercase tracking-wider">
+                  <Grid className="w-4 h-4 text-emerald-400" /> TAKTİKSEL GRID (BATTLEMAP)
                 </span>
               </div>
-
-              <span className="text-[10px] font-mono text-slate-500">[{roomId}]</span>
+              
+              <div className="flex items-center gap-2">
+                <label className="cursor-pointer text-[10px] bg-indigo-950/40 hover:bg-indigo-900/60 text-indigo-300 border border-indigo-900/50 px-2 py-1 rounded transition">
+                  <ImageIcon className="w-3 h-3 inline mr-1" /> Arkaplan Yükle
+                  <input type="file" className="hidden" accept="image/*" onChange={handleGridBgUpload} />
+                </label>
+                {gridBgUrl && (
+                  <button onClick={() => setGridBgUrl(null)} className="text-[10px] text-red-400 hover:text-red-300 bg-red-950/40 border border-red-900/50 px-2 py-1 rounded transition">
+                    <Trash2 className="w-3 h-3 inline" />
+                  </button>
+                )}
+                <div className="w-px h-4 bg-slate-800 mx-1"></div>
+                <label className="text-[10px] text-slate-400">Kare Sayısı:</label>
+                <select 
+                  value={gridSize}
+                  onChange={(e) => setGridSize(Number(e.target.value))}
+                  className="bg-slate-950 border border-slate-800 text-[11px] text-amber-300 rounded-lg px-2 py-0.5 outline-none font-mono focus:border-amber-500"
+                >
+                  <option value={8}>8x8</option>
+                  <option value={12}>12x12</option>
+                  <option value={16}>16x16</option>
+                  <option value={24}>24x24</option>
+                  <option value={32}>32x32</option>
+                </select>
+              </div>
             </div>
 
-            <div className="flex items-center justify-between">
-              <label className="text-[11px] text-slate-400 font-medium">Aktif Bölüm:</label>
-              <select 
-                value={activeChapter} 
-                onChange={(e) => setActiveChapter(Number(e.target.value))}
-                className="bg-slate-950 border border-slate-800 text-xs text-amber-300 rounded-lg px-2.5 py-1 outline-none font-mono focus:border-amber-500"
+            <div className="flex justify-center w-full">
+              <div 
+                className="w-full max-w-[500px] aspect-square relative border border-slate-700/50 bg-slate-950 overflow-hidden rounded-xl shadow-inner"
+                onDragOver={e => e.preventDefault()}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  const id = e.dataTransfer.getData("token_id");
+                  if (!id) return;
+                  const c = combatants.find(x => x.id === id);
+                  
+                  const rect = e.currentTarget.getBoundingClientRect();
+                  const x = e.clientX - rect.left;
+                  const y = e.clientY - rect.top;
+
+                  const cellWidth = rect.width / gridSize;
+                  const cellHeight = rect.height / gridSize;
+
+                  const col = Math.floor(x / cellWidth);
+                  const row = Math.floor(y / cellHeight);
+
+                  setGridTokens(prev => {
+                    if (!c) {
+                      const existingToken = prev[id];
+                      if (existingToken) {
+                        return { ...prev, [id]: { ...existingToken, x: col, y: row } };
+                      }
+                      return prev;
+                    }
+                    return {
+                      ...prev,
+                      [id]: { x: col, y: row, name: c.name, isPlayer: c.isPlayer, avatarUrl: c.avatarUrl }
+                    };
+                  });
+                }}
+                style={{
+                  backgroundImage: gridBgUrl 
+                    ? `linear-gradient(to right, rgba(255,255,255,0.2) 1px, transparent 1px), linear-gradient(to bottom, rgba(255,255,255,0.2) 1px, transparent 1px), url(${gridBgUrl})`
+                    : `linear-gradient(to right, rgba(255,255,255,0.1) 1px, transparent 1px), linear-gradient(to bottom, rgba(255,255,255,0.1) 1px, transparent 1px)`,
+                  backgroundSize: gridBgUrl ? `${100/gridSize}% ${100/gridSize}%, ${100/gridSize}% ${100/gridSize}%, cover` : `${100/gridSize}% ${100/gridSize}%`,
+                  backgroundPosition: '0 0, 0 0, center',
+                  backgroundRepeat: gridBgUrl ? 'repeat, repeat, no-repeat' : 'repeat'
+                }}
               >
-                {Array.from({ length: 30 }, (_, i) => i + 1).map((ch) => {
-                  const hasContent = Boolean(chapterNotes[ch]?.trim());
-                  return (
-                    <option key={ch} value={ch}>
-                      {hasContent ? `🟢 Bölüm ${ch} (Dolu)` : `Bölüm ${ch}`}
-                    </option>
-                  );
-                })}
-              </select>
+              {Object.keys(gridTokens).length === 0 && (
+                <div className="absolute inset-0 flex items-center justify-center text-slate-600 text-[10px] pointer-events-none p-4 text-center">
+                  Savaş alanındaki (Combat Tracker) karakterleri veya yaratıkları sürükleyerek bu alana yerleştirebilirsiniz. <br/> Taşıyarak yerlerini değiştirebilir, üzerlerine sağ tıklayarak silebilirsiniz.
+                </div>
+              )}
+              {Object.entries(gridTokens).map(([id, token]) => (
+                <div
+                  key={id}
+                  draggable
+                  onDragStart={(e) => e.dataTransfer.setData("token_id", id)}
+                  onContextMenu={(e) => { 
+                    e.preventDefault(); 
+                    setGridTokens(prev => { const n = {...prev}; delete n[id]; return n; }); 
+                  }}
+                  className={`absolute flex items-center justify-center rounded-full border-2 cursor-grab active:cursor-grabbing shadow-lg overflow-hidden transition-all duration-75 ${
+                    token.isPlayer ? 'border-blue-500 bg-blue-900/80 shadow-blue-500/20' : 'border-red-500 bg-red-900/80 shadow-red-500/20'
+                  }`}
+                  style={{
+                    left: `${(token.x / gridSize) * 100}%`,
+                    top: `${(token.y / gridSize) * 100}%`,
+                    width: `${100 / gridSize}%`,
+                    height: `${100 / gridSize}%`
+                  }}
+                  title={`${token.name}\nSilmek için sağ tıkla`}
+                >
+                   {token.avatarUrl ? (
+                     <img src={token.avatarUrl} className="w-full h-full object-cover pointer-events-none" />
+                   ) : (
+                     <span className="text-[10px] font-bold text-white truncate px-1 pointer-events-none select-none">{token.name.substring(0, 3)}</span>
+                   )}
+                </div>
+              ))}
+              </div>
             </div>
-
-            <textarea 
-              placeholder={`Bölüm ${activeChapter} olay örgüsü, tuzaklar, NPC motivasyonları...`}
-              value={chapterNotes[activeChapter] || ""}
-              onChange={(e) => handleNoteChange(e.target.value)}
-              className="w-full flex-1 min-h-[160px] bg-slate-950/60 border border-slate-800/80 rounded-xl p-3 text-xs text-slate-200 placeholder:text-slate-600 focus:outline-none focus:border-emerald-500/50 resize-none font-sans"
-            />
           </div>
         </section>
       </div>
@@ -997,23 +1229,64 @@ export default function DMPage() {
                 )}
               </div>
               <div>
-                <h2 className="text-lg font-bold text-amber-400">{selectedPlayer.name}</h2>
-                <p className="text-xs text-slate-400">{selectedPlayer.className} • Seviye {selectedPlayer.level}</p>
+                <input 
+                  value={selectedPlayer.name}
+                  onChange={(e) => updateSelectedPlayerField('name', e.target.value)}
+                  className="text-lg font-bold text-amber-400 bg-transparent outline-none w-full"
+                />
+                <div className="flex items-center gap-1 text-xs text-slate-400">
+                  <input 
+                    value={selectedPlayer.className}
+                    onChange={(e) => updateSelectedPlayerField('className', e.target.value)}
+                    className="bg-transparent outline-none w-16"
+                  />
+                  • Seviye 
+                  <input 
+                    type="number"
+                    value={selectedPlayer.level}
+                    onChange={(e) => updateSelectedPlayerField('level', Number(e.target.value))}
+                    className="bg-transparent outline-none w-8 text-center"
+                  />
+                </div>
               </div>
             </div>
-            <button onClick={() => setSelectedPlayer(null)} className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-white">
-              <X className="w-5 h-5" />
-            </button>
+            <div className="flex gap-2">
+              <button onClick={savePlayerChanges} className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold transition">
+                Kaydet
+              </button>
+              <button onClick={() => setSelectedPlayer(null)} className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-white transition">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
           </div>
 
           <div className="grid grid-cols-2 gap-3 text-center">
             <div className="p-3 rounded-xl bg-slate-950 border border-slate-800 shadow-inner">
               <p className="text-[10px] text-slate-400 uppercase font-bold tracking-wider mb-0.5">AC / DR</p>
-              <p className="text-xl font-bold font-mono text-blue-400">{selectedPlayer.armorClass}</p>
+              <input 
+                type="number"
+                value={selectedPlayer.armorClass}
+                onChange={(e) => updateSelectedPlayerField('armorClass', Number(e.target.value))}
+                className="text-xl font-bold font-mono text-blue-400 bg-transparent text-center outline-none w-full"
+              />
             </div>
             <div className="p-3 rounded-xl bg-slate-950 border border-slate-800 shadow-inner">
               <p className="text-[10px] text-slate-400 uppercase font-bold tracking-wider mb-0.5">CAN</p>
-              <p className="text-xl font-bold font-mono text-emerald-400">{selectedPlayer.currentHp}/{selectedPlayer.maxHp}</p>
+              <div className="flex items-center justify-center gap-1 text-xl font-bold font-mono text-emerald-400">
+                <input 
+                  type="number"
+                  value={selectedPlayer.currentHp}
+                  onChange={(e) => updateSelectedPlayerField('currentHp', Number(e.target.value))}
+                  className="bg-transparent text-right outline-none w-12"
+                />
+                /
+                <input 
+                  type="number"
+                  value={selectedPlayer.maxHp}
+                  onChange={(e) => updateSelectedPlayerField('maxHp', Number(e.target.value))}
+                  className="bg-transparent text-left outline-none w-12"
+                />
+              </div>
             </div>
           </div>
 
@@ -1021,28 +1294,88 @@ export default function DMPage() {
             <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider">6 Nitelik (Canlı)</p>
             <div className="grid grid-cols-3 gap-2 text-center">
               {Object.entries(selectedPlayer.stats).map(([k, v]) => (
-                <div key={k} className="p-2.5 bg-slate-950/70 border border-slate-800 rounded-xl">
-                  <span className="text-[10px] text-slate-500 uppercase font-bold">{k}</span>
-                  <p className="text-base font-bold font-mono text-slate-100">
-                    {v} <span className="text-amber-400 text-xs font-semibold">({Math.floor((v-10)/2) >= 0 ? `+${Math.floor((v-10)/2)}` : Math.floor((v-10)/2)})</span>
-                  </p>
+                <div key={k} className="p-2 bg-slate-950/70 border border-slate-800 rounded-xl">
+                  <span className="text-[10px] text-slate-500 uppercase font-bold block mb-1">{k}</span>
+                  <div className="flex items-center justify-center">
+                    <input 
+                      type="number"
+                      value={v}
+                      onChange={(e) => updateSelectedPlayerStat(k as keyof CharacterDto['stats'], Number(e.target.value))}
+                      className="text-base font-bold font-mono text-slate-100 bg-transparent text-center outline-none w-8"
+                    />
+                  </div>
                 </div>
               ))}
             </div>
           </div>
 
           <div className="space-y-2">
-            <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Kuşanılan Teçhizat</p>
-            <div className="p-3 bg-slate-950/70 border border-slate-800 rounded-xl text-xs text-slate-300">
-              <p className="whitespace-pre-line font-mono">{selectedPlayer.equipment || "Teçhizat bilgisi girilmedi."}</p>
+            <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Para / Servet</p>
+            <div className="grid grid-cols-3 gap-2">
+              <div className="p-2 bg-slate-950/70 border border-slate-800 rounded-xl flex items-center justify-center gap-1.5">
+                <span className="text-amber-500 font-bold text-[10px]">A:</span>
+                <input 
+                  type="number"
+                  value={selectedPlayer.gold || 0}
+                  onChange={(e) => updateSelectedPlayerField('gold', Number(e.target.value))}
+                  className="w-12 bg-transparent text-xs text-slate-100 font-mono outline-none text-center"
+                />
+              </div>
+              <div className="p-2 bg-slate-950/70 border border-slate-800 rounded-xl flex items-center justify-center gap-1.5">
+                <span className="text-slate-400 font-bold text-[10px]">G:</span>
+                <input 
+                  type="number"
+                  value={selectedPlayer.silver || 0}
+                  onChange={(e) => updateSelectedPlayerField('silver', Number(e.target.value))}
+                  className="w-12 bg-transparent text-xs text-slate-100 font-mono outline-none text-center"
+                />
+              </div>
+              <div className="p-2 bg-slate-950/70 border border-slate-800 rounded-xl flex items-center justify-center gap-1.5">
+                <span className="text-orange-700 font-bold text-[10px]">B:</span>
+                <input 
+                  type="number"
+                  value={selectedPlayer.copper || 0}
+                  onChange={(e) => updateSelectedPlayerField('copper', Number(e.target.value))}
+                  className="w-12 bg-transparent text-xs text-slate-100 font-mono outline-none text-center"
+                />
+              </div>
             </div>
           </div>
 
           <div className="space-y-2">
-            <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Karakter Notları / Sırlar</p>
-            <p className="text-xs text-slate-400 italic bg-slate-950/40 p-3 rounded-xl border border-slate-800/60">
-              "{selectedPlayer.backstory || "Herhangi bir not veya sır girilmedi."}"
-            </p>
+            <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Özellikler & Yetenekler</p>
+            <textarea 
+              value={selectedPlayer.features || ""}
+              onChange={(e) => updateSelectedPlayerField('features', e.target.value)}
+              className="w-full min-h-[80px] p-3 bg-slate-950/70 border border-slate-800 rounded-xl text-xs text-slate-300 font-mono outline-none focus:border-amber-500/50 resize-none"
+            />
+          </div>
+
+          <div className="space-y-2">
+            <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Kuşanılan Teçhizat</p>
+            <textarea 
+              value={selectedPlayer.equipment || ""}
+              onChange={(e) => updateSelectedPlayerField('equipment', e.target.value)}
+              className="w-full min-h-[80px] p-3 bg-slate-950/70 border border-slate-800 rounded-xl text-xs text-slate-300 font-mono outline-none focus:border-amber-500/50 resize-none"
+            />
+          </div>
+          
+          <div className="space-y-2">
+            <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Çanta (Envanter)</p>
+            <textarea 
+              value={selectedPlayer.bag || ""}
+              onChange={(e) => updateSelectedPlayerField('bag', e.target.value)}
+              className="w-full min-h-[80px] p-3 bg-slate-950/70 border border-slate-800 rounded-xl text-xs text-slate-300 font-mono outline-none focus:border-amber-500/50 resize-none"
+            />
+          </div>
+
+          <div className="space-y-2">
+            <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Karakter Notları / Geçmiş</p>
+            <textarea 
+              value={selectedPlayer.notes || selectedPlayer.backstory || ""}
+              onChange={(e) => updateSelectedPlayerField('notes', e.target.value)}
+              className="w-full min-h-[80px] p-3 bg-slate-950/40 border border-slate-800/60 rounded-xl text-xs text-slate-400 italic outline-none focus:border-amber-500/50 resize-none"
+            />
           </div>
         </div>
       )}

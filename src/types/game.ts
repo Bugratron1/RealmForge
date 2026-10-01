@@ -31,7 +31,13 @@ export interface CharacterDto {
   skills?: string[] | Record<string, number>;
   equipment: string;
   gold: number;
+  silver?: number;
+  copper?: number;
   backstory: string;
+  notes?: string;
+  features?: string;
+  bag?: string;
+  moneyAmount?: number;
   conditions: string[];
   avatarUrl: string | null;
   lastJoinedRoom?: string | null;

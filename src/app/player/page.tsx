@@ -22,6 +22,7 @@ import {
   LogOutIcon,
   RotateCcw,
   ImageIcon,
+  Grid,
 } from "lucide-react";
 import { getActiveMap } from "@/lib/mapDb";
 import { useReactToPrint } from "react-to-print";
@@ -115,6 +116,12 @@ export default function PlayerPage() {
 
   const [showMap, setShowMap] = useState(false);
   const [mapImageUrl, setMapImageUrl] = useState<string | null>(null);
+  
+  const [showBattlemap, setShowBattlemap] = useState(false);
+  const [gridSize, setGridSize] = useState(16);
+  const [gridTokens, setGridTokens] = useState<Record<string, { x: number, y: number, name: string, isPlayer: boolean, avatarUrl?: string | null }>>({});
+  const [gridBgUrl, setGridBgUrl] = useState<string | null>(null);
+
   const [diceToast, setDiceToast] = useState<{
     text: string;
     isFading: boolean;
@@ -138,6 +145,9 @@ export default function PlayerPage() {
     avatarUrl,
     equipment,
     notes,
+    features,
+    bag,
+    gold, silver, copper,
   });
   useEffect(() => {
     characterSnapshotRef.current = {
@@ -151,6 +161,9 @@ export default function PlayerPage() {
       avatarUrl,
       equipment,
       notes,
+      features,
+      bag,
+      gold, silver, copper,
     };
   }, [
     name,
@@ -163,6 +176,9 @@ export default function PlayerPage() {
     avatarUrl,
     equipment,
     notes,
+    features,
+    bag,
+    gold, silver, copper,
   ]);
 
   const calcMod = (val: number) => {
@@ -302,6 +318,9 @@ export default function PlayerPage() {
     setEquipment("");
     setBag("");
     setNotes("");
+    setGold(0);
+    setSilver(0);
+    setCopper(0);
     setLastJoinedRoom(null);
 
     setCharacterId(newId);
@@ -362,10 +381,26 @@ export default function PlayerPage() {
       equipment,
       bag,
       lastJoinedRoom,
+      gold,
+      silver,
+      copper,
+      moneyAmount: gold * 500 + silver * 10 + copper,
     };
 
     try {
       localStorage.setItem(`frp_char_${characterId}`, JSON.stringify(fullData));
+      
+      // Oyuncu tarafında bir şey değiştiğinde otomatik olarak DM'e senkronize et
+      if (roomId && channelRef.current) {
+        const payload = {
+          type: "PLAYER_DATA_SYNC",
+          roomId: roomId,
+          player: fullData
+        };
+        channelRef.current.postMessage(payload);
+        peerNetwork.send(payload);
+      }
+
       const t = setTimeout(() => setSaveStatus("saved"), 350);
       return () => clearTimeout(t);
     } catch (err) {}
@@ -384,9 +419,13 @@ export default function PlayerPage() {
     notes,
     equipment,
     bag,
-      lastJoinedRoom,
+    lastJoinedRoom,
     isLoaded,
     characterId,
+    roomId,
+    gold,
+    silver,
+    copper,
   ]);
 
   const handleManualSave = async () => {
@@ -591,8 +630,13 @@ export default function PlayerPage() {
           stats: snap.stats,
           avatarUrl: snap.avatarUrl,
           equipment: snap.equipment,
-          gold: 0,
-          notes: snap.notes ? [snap.notes] : [],
+          features: snap.features,
+          bag: snap.bag,
+          notes: snap.notes,
+          gold: snap.gold || 0,
+          silver: snap.silver || 0,
+          copper: snap.copper || 0,
+          moneyAmount: snap.gold * 500 + snap.silver * 10 + snap.copper,
         },
       };
       bc.postMessage(payload);
@@ -619,6 +663,13 @@ export default function PlayerPage() {
         triggerCinematicToast("🚪 Masa kapatıldı.");
         window.history.replaceState({}, "", `/player?char=${characterId}`);
         return;
+        return;
+      }
+
+      if (data.type === "BATTLEMAP_SYNC") {
+        setGridSize(data.gridSize);
+        setGridTokens(data.gridTokens);
+        setGridBgUrl(data.gridBgUrl);
       }
 
       if (data.type === "DM_PING" && data.roomId === roomId) {
@@ -688,6 +739,31 @@ export default function PlayerPage() {
       if (data.type === "COMBAT_SYNC" && data.combatants) {
         setActiveCombatants(data.combatants);
         setActiveTurnName(data.activeCombatantName);
+        return;
+      }
+
+      if (data.type === "DM_OVERRIDE_PLAYER" && data.player && data.player.id === characterId) {
+        const p = data.player;
+        if (p.name !== undefined) setName(p.name);
+        if (p.className !== undefined) setClassName(p.className);
+        if (p.level !== undefined) setLevel(p.level);
+        if (p.armorClass !== undefined) setArmorClass(p.armorClass);
+        if (p.currentHp !== undefined) setCurrentHp(p.currentHp);
+        if (p.maxHp !== undefined) setMaxHp(p.maxHp);
+        if (p.stats !== undefined) setStats(p.stats);
+        if (p.equipment !== undefined) setEquipment(p.equipment);
+        if (p.notes !== undefined) setNotes(p.notes);
+        if (p.features !== undefined) setFeatures(p.features);
+        if (p.bag !== undefined) setBag(p.bag);
+        if (p.gold !== undefined) setGold(p.gold);
+        if (p.silver !== undefined) setSilver(p.silver);
+        if (p.copper !== undefined) setCopper(p.copper);
+        if (p.moneyAmount !== undefined && p.gold === undefined) {
+          setGold(Math.floor(p.moneyAmount / 500));
+          setSilver(Math.floor((p.moneyAmount % 500) / 10));
+          setCopper(p.moneyAmount % 10);
+        }
+        triggerCinematicToast("✨ DM karakterinizi güncelledi!");
         return;
       }
     };
@@ -1044,6 +1120,114 @@ export default function PlayerPage() {
           </p>
         )}
       </div>
+      {/* SAVAŞ ALANININ ALTINDAKİ BATTLEMAP BUTONU */}
+      <div className="max-w-6xl mx-auto">
+        <button
+          onClick={() => setShowBattlemap(!showBattlemap)}
+          className={`w-full py-2.5 px-4 rounded-xl text-xs font-bold border transition flex items-center justify-between shadow-md active:scale-[0.99] mb-3 ${
+            showBattlemap
+              ? "bg-indigo-500/15 border-indigo-500/50 text-indigo-300"
+              : "bg-[#0d1322] hover:bg-[#131b30] border-slate-800 hover:border-indigo-500/40 text-slate-300"
+          }`}
+        >
+          <div className="flex items-center gap-2">
+            <Grid className="w-4 h-4 text-indigo-400" />
+            <span>
+              TAKTİKSEL GRID (BATTLEMAP){" "}
+              {roomId ? `(CANLI - ${roomId})` : "(MASA DIŞI)"}
+            </span>
+          </div>
+          <div className="flex items-center gap-1.5 text-slate-400 font-mono text-[11px]">
+            <span>{showBattlemap ? "Grid'i Gizle" : "Grid'i Aç"}</span>
+            {showBattlemap ? (
+              <ChevronUp className="w-4 h-4 text-indigo-400" />
+            ) : (
+              <ChevronDown className="w-4 h-4" />
+            )}
+          </div>
+        </button>
+
+        {showBattlemap && (
+          <div className="mb-3 bg-[#0d1322] border border-indigo-500/30 rounded-2xl p-4 shadow-2xl flex flex-col items-center">
+             <div 
+                className="w-full max-w-[500px] aspect-square relative border border-slate-700/50 bg-slate-950 overflow-hidden rounded-xl shadow-inner"
+                onDragOver={e => e.preventDefault()}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  if (!roomId) return;
+                  const id = e.dataTransfer.getData("token_id");
+                  if (!id) return;
+                  
+                  const rect = e.currentTarget.getBoundingClientRect();
+                  const x = e.clientX - rect.left;
+                  const y = e.clientY - rect.top;
+
+                  const cellWidth = rect.width / gridSize;
+                  const cellHeight = rect.height / gridSize;
+
+                  const col = Math.floor(x / cellWidth);
+                  const row = Math.floor(y / cellHeight);
+
+                  const payload = {
+                    type: "BATTLEMAP_UPDATE_TOKEN",
+                    roomId,
+                    tokenId: id,
+                    x: col,
+                    y: row
+                  };
+                  if (channelRef.current) channelRef.current.postMessage(payload);
+                  peerNetwork.send(payload);
+                  
+                  setGridTokens(prev => {
+                    const existingToken = prev[id];
+                    if (existingToken) {
+                      return { ...prev, [id]: { ...existingToken, x: col, y: row } };
+                    }
+                    return prev;
+                  });
+                }}
+                style={{
+                  backgroundImage: gridBgUrl 
+                    ? `linear-gradient(to right, rgba(255,255,255,0.2) 1px, transparent 1px), linear-gradient(to bottom, rgba(255,255,255,0.2) 1px, transparent 1px), url(${gridBgUrl})`
+                    : `linear-gradient(to right, rgba(255,255,255,0.1) 1px, transparent 1px), linear-gradient(to bottom, rgba(255,255,255,0.1) 1px, transparent 1px)`,
+                  backgroundSize: gridBgUrl ? `${100/gridSize}% ${100/gridSize}%, ${100/gridSize}% ${100/gridSize}%, cover` : `${100/gridSize}% ${100/gridSize}%`,
+                  backgroundPosition: '0 0, 0 0, center',
+                  backgroundRepeat: gridBgUrl ? 'repeat, repeat, no-repeat' : 'repeat'
+                }}
+              >
+              {Object.keys(gridTokens).length === 0 && (
+                <div className="absolute inset-0 flex items-center justify-center text-slate-600 text-[10px] pointer-events-none p-4 text-center">
+                  DM henüz harita alanına kimseyi yerleştirmedi.
+                </div>
+              )}
+              {Object.entries(gridTokens).map(([id, token]) => (
+                <div
+                  key={id}
+                  draggable
+                  onDragStart={(e) => e.dataTransfer.setData("token_id", id)}
+                  className={`absolute flex items-center justify-center rounded-full border-2 cursor-grab active:cursor-grabbing shadow-lg overflow-hidden transition-all duration-75 ${
+                    token.isPlayer ? 'border-blue-500 bg-blue-900/80 shadow-blue-500/20' : 'border-red-500 bg-red-900/80 shadow-red-500/20'
+                  }`}
+                  style={{
+                    left: `${(token.x / gridSize) * 100}%`,
+                    top: `${(token.y / gridSize) * 100}%`,
+                    width: `${100 / gridSize}%`,
+                    height: `${100 / gridSize}%`
+                  }}
+                  title={token.name}
+                >
+                   {token.avatarUrl ? (
+                     <img src={token.avatarUrl} className="w-full h-full object-cover pointer-events-none" />
+                   ) : (
+                     <span className="text-[10px] font-bold text-white truncate px-1 pointer-events-none select-none">{token.name.substring(0, 3)}</span>
+                   )}
+                </div>
+              ))}
+              </div>
+          </div>
+        )}
+      </div>
+
       {/* SAVAŞ ALANININ ALTINDAKİ HARİTA BUTONU */}
       <div className="max-w-6xl mx-auto">
         <button
